@@ -21,7 +21,11 @@ import time
 import uuid
 from datetime import datetime, timezone
 import requests
+import os
+from dotenv import load_dotenv
+load_dotenv()
 
+OTEL_LOG_ENDPOINT = os.getenv("OTEL_LOG_ENDPOINT")
 
 SERVICES = [
     "auth-service",
@@ -351,8 +355,8 @@ Text formats (sent as text/plain):
     )
 
     parser.add_argument(
-        "--url", default="http://localhost:8000/otel/logs",
-        help="OTel endpoint URL (default: http://localhost:8000/otel/logs)",
+        "--url", default=OTEL_LOG_ENDPOINT or "http://localhost:8000/otel/logs",
+        help="OTel endpoint URL (default: ${OTEL_LOG_ENDPOINT} env var or http://localhost:8000/otel/logs)",
     )
     parser.add_argument(
         "--count", type=int, default=10,
