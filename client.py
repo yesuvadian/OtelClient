@@ -2,12 +2,17 @@
 OTel Log Client — sends simulated logs in VARIED formats to test
 the server's log normalization.
 
-Formats:
+JSON formats (sent as application/json):
   - Standard:  {timestamp, service, level, message}
   - OTel:      {timeUnixNano, serviceName, severityText, body, traceId, spanId}
   - Syslog:    {datetime, host, priority, msg, facility}
   - CloudApp:  {ts, app, severity, text, environment, region}
   - Minimal:   {message}  (barely anything — server must fill defaults)
+
+Text formats (sent as text/plain):
+  - Python:    DEBUG:botocore.hooks:Changing event name...
+  - Bracket:   [ERROR] auth-service - Token expired
+  - Stamped:   2026-03-07 09:28:44 ERROR auth-service - Token expired
 """
 
 import argparse
@@ -26,6 +31,17 @@ SERVICES = [
     "notification-service",
 ]
 
+PYTHON_LOGGERS = [
+    "botocore.hooks",
+    "botocore.credentials",
+    "urllib3.connectionpool",
+    "bedrock_agentcore.app",
+    "uvicorn.access",
+    "sqlalchemy.engine",
+    "celery.worker",
+    "django.request",
+]
+
 LEVELS = ["DEBUG", "INFO", "WARN", "ERROR", "CRITICAL"]
 
 MESSAGES = {
@@ -35,6 +51,8 @@ MESSAGES = {
         "Database query executed in 12ms",
         "Serializing response payload",
         "Attempting retry for transient failure",
+        "Changing event name from before-parameter-build.route53 to before-parameter-build.route-53",
+        "Changing event name from request-created.cloudsearchdomain.Search to request-created.cloudsearch-domain.Search",
     ],
     "INFO": [
         "User login successful",
@@ -42,6 +60,8 @@ MESSAGES = {
         "Payment processed for $49.99",
         "Email notification sent",
         "Health check passed",
+        "Returning streaming response (generator) (0.000s)",
+        "Application startup complete",
     ],
     "WARN": [
         "Response time exceeded 2s threshold",
@@ -76,7 +96,7 @@ REGIONS = ["us-east-1", "eu-west-1", "ap-southeast-1"]
 FACILITIES = ["kern", "user", "daemon", "auth", "local0"]
 
 
-# ── Log Generators (one per format) ─────────────────────────────────
+# ── JSON Log Generators ─────────────────────────────────────────────
 
 def generate_standard_log():
     """Standard format: {timestamp, service, level, message}"""
@@ -138,8 +158,36 @@ def generate_minimal_log():
     }
 
 
-# ── Format selector ─────────────────────────────────────────────────
-FORMAT_GENERATORS = {
+# ── Text Log Generators ─────────────────────────────────────────────
+
+def generate_python_log():
+    """Python logging style: LEVEL:logger.name:message"""
+    level = random.choice(LEVELS)
+    logger = random.choice(PYTHON_LOGGERS)
+    msg = random.choice(MESSAGES[level])
+    return f"{level}:{logger}:{msg}"
+
+
+def generate_bracket_log():
+    """Bracket style: [LEVEL] service - message"""
+    level = random.choice(LEVELS)
+    svc = random.choice(SERVICES)
+    msg = random.choice(MESSAGES[level])
+    return f"[{level}] {svc} - {msg}"
+
+
+def generate_stamped_log():
+    """Timestamped style: 2026-03-07 09:28:44 LEVEL service - message"""
+    level = random.choice(LEVELS)
+    svc = random.choice(SERVICES)
+    msg = random.choice(MESSAGES[level])
+    ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+    return f"{ts} {level} {svc} - {msg}"
+
+
+# ── Format registry ─────────────────────────────────────────────────
+
+JSON_FORMATS = {
     "standard": generate_standard_log,
     "otel": generate_otel_log,
     "syslog": generate_syslog_log,
@@ -147,14 +195,31 @@ FORMAT_GENERATORS = {
     "minimal": generate_minimal_log,
 }
 
-FORMAT_NAMES = list(FORMAT_GENERATORS.keys())
+TEXT_FORMATS = {
+    "python": generate_python_log,
+    "bracket": generate_bracket_log,
+    "stamped": generate_stamped_log,
+}
+
+ALL_FORMATS = {**JSON_FORMATS, **TEXT_FORMATS}
+ALL_FORMAT_NAMES = list(ALL_FORMATS.keys())
+JSON_FORMAT_NAMES = list(JSON_FORMATS.keys())
+TEXT_FORMAT_NAMES = list(TEXT_FORMATS.keys())
+
+
+def is_text_format(fmt):
+    return fmt in TEXT_FORMATS
 
 
 def generate_log(fmt="mixed"):
     """Generate a single log in the specified format. 'mixed' picks randomly."""
     if fmt == "mixed":
-        fmt = random.choice(FORMAT_NAMES)
-    gen = FORMAT_GENERATORS.get(fmt, generate_standard_log)
+        fmt = random.choice(ALL_FORMAT_NAMES)
+    elif fmt == "mixed-json":
+        fmt = random.choice(JSON_FORMAT_NAMES)
+    elif fmt == "mixed-text":
+        fmt = random.choice(TEXT_FORMAT_NAMES)
+    gen = ALL_FORMATS.get(fmt, generate_standard_log)
     return gen(), fmt
 
 
@@ -169,9 +234,25 @@ def generate_batch(count, fmt="mixed"):
     return logs, format_counts
 
 
-def send_batch(url, logs):
-    payload = {"logs": logs}
-    response = requests.post(url, json=payload, timeout=10)
+def send_batch(url, logs, format_counts):
+    """
+    Send batch to server. Auto-picks content type:
+      - All text logs      → text/plain (newline-separated)
+      - All JSON/dict logs → application/json
+      - Mixed              → application/json with strings in the logs array
+    """
+    text_count = sum(format_counts.get(f, 0) for f in TEXT_FORMATS)
+    json_count = sum(format_counts.get(f, 0) for f in JSON_FORMATS)
+
+    if json_count == 0 and text_count > 0:
+        # All text — send as text/plain
+        body = "\n".join(logs)
+        response = requests.post(url, data=body, headers={"Content-Type": "text/plain"}, timeout=10)
+    else:
+        # JSON or mixed — send as JSON (text logs become strings in the array)
+        payload = {"logs": logs}
+        response = requests.post(url, json=payload, timeout=10)
+
     response.raise_for_status()
     return response.json()
 
@@ -189,13 +270,14 @@ def print_results(response_data, batch_number=None, format_counts=None):
         fmt_str = ", ".join(f"{k}: {v}" for k, v in sorted(format_counts.items()))
         print(f"  Formats: {fmt_str}")
 
-    # Show rejected details
+    # Show details
     for r in response_data.get("results", []):
         if r.get("status") == "rejected":
             print(f"  [REJECTED] Log #{r['index']}: {r.get('errors', 'unknown')}")
         elif r.get("status") == "accepted" and r.get("normalized"):
             n = r["normalized"]
-            print(f"  [OK] Log #{r['index']}: [{n['level']:<8}] {n['service']:<24} {n['message'][:60]}")
+            storage = r.get("storage", "?")
+            print(f"  [OK] Log #{r['index']}: [{n['level']:<8}] {n['service']:<24} {n['message'][:50]}  ({storage})")
 
 
 def run_one_shot(url, count, fmt):
@@ -203,11 +285,14 @@ def run_one_shot(url, count, fmt):
 
     print(f"Sending {count} logs to {url} (format: {fmt}) ...")
     for i, log in enumerate(logs):
-        keys = ", ".join(log.keys())
-        print(f"  #{i}: fields=[{keys}]")
+        if isinstance(log, str):
+            print(f"  #{i}: [text] {log[:80]}")
+        else:
+            keys = ", ".join(log.keys())
+            print(f"  #{i}: [json] fields=[{keys}]")
 
     try:
-        data = send_batch(url, logs)
+        data = send_batch(url, logs, format_counts)
         print_results(data, format_counts=format_counts)
     except requests.RequestException as e:
         print(f"\nError: Could not reach server - {e}")
@@ -225,7 +310,7 @@ def run_continuous(url, count, interval, fmt):
             logs, format_counts = generate_batch(count, fmt)
 
             try:
-                data = send_batch(url, logs)
+                data = send_batch(url, logs, format_counts)
                 print_results(data, batch_number, format_counts)
             except requests.RequestException as e:
                 print(f"\nBatch #{batch_number} failed: {e}")
@@ -236,8 +321,33 @@ def run_continuous(url, count, interval, fmt):
 
 
 def main():
+    all_choices = [
+        "mixed", "mixed-json", "mixed-text",
+        "standard", "otel", "syslog", "cloud", "minimal",
+        "python", "bracket", "stamped",
+    ]
+
     parser = argparse.ArgumentParser(
-        description="OTel Log Client - send simulated logs in varied formats"
+        description="OTel Log Client - send simulated logs in varied formats",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Format groups:
+  mixed         All formats randomly (JSON + text)
+  mixed-json    JSON formats only (standard, otel, syslog, cloud, minimal)
+  mixed-text    Text formats only (python, bracket, stamped)
+
+JSON formats:
+  standard      {timestamp, service, level, message}
+  otel          {timeUnixNano, serviceName, severityText, body, ...}
+  syslog        {datetime, host, priority, msg, facility, ...}
+  cloud         {ts, app, severity, text, environment, region, ...}
+  minimal       {message}
+
+Text formats (sent as text/plain):
+  python        DEBUG:botocore.hooks:Changing event name...
+  bracket       [ERROR] auth-service - Token expired
+  stamped       2026-03-07 09:28:44 ERROR auth-service - Token expired
+""",
     )
 
     parser.add_argument(
@@ -258,8 +368,8 @@ def main():
     )
     parser.add_argument(
         "--format", dest="fmt", default="mixed",
-        choices=["mixed", "standard", "otel", "syslog", "cloud", "minimal"],
-        help="Log format to send (default: mixed — random per log)",
+        choices=all_choices,
+        help="Log format to send (default: mixed)",
     )
 
     args = parser.parse_args()
